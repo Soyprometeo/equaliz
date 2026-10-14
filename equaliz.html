@@ -1,0 +1,365 @@
+
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<style>
+:root {
+  --bg: #1E1E26;
+  --panel: #312D35;
+  --title: #FFF;
+  --subtitle: #D2D2D2;
+  --text: #E2E2E3;
+  --secondary: #3E3E46;
+  --accent: #c8ed4f;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: Arial, sans-serif;
+  padding: 20px;
+}
+
+main {
+  max-width: 450px;
+  margin: auto;
+  padding: 20px;
+  background: var(--panel);
+}
+
+input {
+  accent-color: var(--accent);
+}
+
+label {
+  display: block;
+  margin-top: 15px;
+}
+
+.slider-wrap {
+  position: relative;
+  margin-bottom: 8px;
+}
+
+input[type="range"] {
+  width: 100%;
+  display: block;
+  margin: 0;
+}
+
+.slider-wrap::after {
+  content: "•";
+  position: absolute;
+  left: var(--initial);
+  top: 12px;
+  transform: translateX(-50%);
+  color: var(--secondary);
+  pointer-events: none;
+  line-height: 1;
+}
+
+button {
+  background: var(--accent);
+  color: var(--bg);
+  border: 0;
+  padding: 10px;
+  cursor: pointer;
+}
+
+audio {
+  width: 100%;
+  margin-top: 15px;
+}
+
+canvas {
+  display: block;
+  width: 100%;
+  height: 110px;
+  margin-top: 20px;
+  background: var(--bg);
+}
+
+.bands {
+  display: grid;
+  grid-template-columns: 36.6fr 40.2fr 23.2fr;
+  color: var(--text);
+  text-align: center;
+}
+</style>
+</head>
+
+<body>
+<main>
+<h2><b>Eq</b>ualiz</h2>
+<input type="file" id="file" accept="audio/*">
+<audio id="audio" controls></audio>
+
+<div id="controls">
+  <label>Volumen</label>
+  <div class="slider-wrap"><input id="vol" type="range" min="0" max="2" step="any" value="1"></div>
+
+  <label>Velocidad</label>
+  <div class="slider-wrap"><input id="speed" type="range" min=".5" max="2" step="any" value="1"></div>
+
+  <label>Pitch</label>
+  <div class="slider-wrap"><input id="pitch" type="range" min="-12" max="12" step="any" value="0"></div>
+
+  <label>Reverberación</label>
+  <div class="slider-wrap"><input id="reverb" type="range" min="0" max="1" step="any" value="0"></div>
+
+  <label>Bajos</label>
+  <div class="slider-wrap"><input id="lo" type="range" min="-15" max="15" step="any" value="0"></div>
+
+  <label>Medios</label>
+  <div class="slider-wrap"><input id="mid" type="range" min="-15" max="15" step="any" value="0"></div>
+
+  <label>Agudos</label>
+  <div class="slider-wrap"><input id="hi" type="range" min="-15" max="15" step="any" value="0"></div>
+</div>
+
+<canvas id="spectrum"></canvas>
+<div class="bands">
+  <span>lo</span>
+  <span>mid</span>
+  <span>hi</span>
+</div>
+</main>
+
+<script type="module">
+const $ = id => document.getElementById(id);
+const audio = $("audio");
+
+// Marca de posición inicial y snap
+document.querySelectorAll('input[type="range"]').forEach(slider => {
+  const min = Number(slider.min || 0);
+  const max = Number(slider.max || 100);
+  const initial = Number(slider.defaultValue);
+  const wrap = slider.parentElement;
+
+  const fraction = (initial - min) / (max - min);
+  wrap.style.setProperty("--initial", `${fraction * 100}%`);
+
+  slider.addEventListener("input", () => {
+    const rect = slider.getBoundingClientRect();
+    const style = getComputedStyle(slider);
+    const thumbRadius = 8;
+
+    const usableWidth = rect.width - thumbRadius * 2;
+    const initialX = rect.left + thumbRadius + fraction * usableWidth;
+    const currentFraction =
+      (Number(slider.value) - min) / (max - min);
+    const currentX = rect.left + thumbRadius +
+      currentFraction * usableWidth;
+
+    if (Math.abs(currentX - initialX) <= 7) {
+      slider.value = initial;
+    }
+  });
+});
+
+let ctx, gain, filters = [], dry, wet, analyser, pitchNode;
+let soundTouchClass;
+let currentURL;
+
+async function initialize() {
+  if (ctx) return;
+
+  const module = await import(
+    "https://esm.sh/@soundtouchjs/audio-worklet@2.1.1"
+  );
+  soundTouchClass = module.SoundTouchNode;
+
+  ctx = new AudioContext();
+
+  await soundTouchClass.register(
+    ctx,
+    "https://unpkg.com/@soundtouchjs/audio-worklet@2.1.1/processor"
+  );
+
+  const src = ctx.createMediaElementSource(audio);
+
+  pitchNode = new soundTouchClass({ context: ctx });
+  gain = ctx.createGain();
+
+  const freqs = [250, 1000, 4000];
+
+  filters = freqs.map((freq, i) => {
+    const f = ctx.createBiquadFilter();
+    f.type = ["lowshelf", "peaking", "highshelf"][i];
+    f.frequency.value = freq;
+    return f;
+  });
+
+  dry = ctx.createGain();
+  wet = ctx.createGain();
+
+  const conv = ctx.createConvolver();
+  const impulse = ctx.createBuffer(
+    2, ctx.sampleRate * 2, ctx.sampleRate
+  );
+
+  for (let c = 0; c < 2; c++) {
+    const d = impulse.getChannelData(c);
+    for (let i = 0; i < d.length; i++) {
+      d[i] = (Math.random() * 2 - 1) *
+        (1 - i / d.length) ** 3;
+    }
+  }
+
+  conv.buffer = impulse;
+
+  analyser = ctx.createAnalyser();
+  analyser.fftSize = 2048;
+
+  src.connect(pitchNode);
+  pitchNode.connect(gain);
+
+  let node = gain;
+  filters.forEach(f => {
+    node.connect(f);
+    node = f;
+  });
+
+  node.connect(dry);
+  node.connect(conv);
+  conv.connect(wet);
+
+  dry.connect(analyser);
+  wet.connect(analyser);
+  analyser.connect(ctx.destination);
+
+  audio.preservesPitch = false;
+  pitchNode.playbackRate.value = audio.playbackRate;
+
+  updateControls();
+  draw();
+}
+
+$("file").onchange = async () => {
+  const f = $("file").files[0];
+  if (!f) return;
+
+  try {
+    await initialize();
+
+    if (currentURL) URL.revokeObjectURL(currentURL);
+    currentURL = URL.createObjectURL(f);
+    audio.src = currentURL;
+
+    await ctx.resume();
+  } catch (err) {
+    console.error("No se pudo iniciar el procesador de audio:", err);
+  }
+};
+
+$("vol").oninput = () => {
+  if (gain) gain.gain.value = +$("vol").value;
+};
+
+$("speed").oninput = () => {
+  const speed = +$("speed").value;
+
+  audio.playbackRate = speed;
+
+  if (pitchNode) {
+    pitchNode.playbackRate.value = speed;
+  }
+};
+
+$("pitch").oninput = () => {
+  if (pitchNode) {
+    pitchNode.pitchSemitones.setTargetAtTime(
+      +$("pitch").value,
+      ctx.currentTime,
+      0.03
+    );
+  }
+};
+
+["lo", "mid", "hi"].forEach((id, i) => {
+  $(id).oninput = () => {
+    if (filters[i]) filters[i].gain.value = +$(id).value;
+  };
+});
+
+$("reverb").oninput = () => {
+  if (wet) {
+    const v = +$("reverb").value;
+    wet.gain.value = v;
+    dry.gain.value = 1 - v * 0.5;
+  }
+};
+
+function updateControls() {
+  if (gain) gain.gain.value = +$("vol").value;
+
+  if (pitchNode) {
+    pitchNode.pitchSemitones.value = +$("pitch").value;
+    pitchNode.playbackRate.value = audio.playbackRate;
+  }
+
+  filters.forEach((f, i) => {
+    f.gain.value = +$([ "lo", "mid", "hi" ][i]).value;
+  });
+
+  if (wet && dry) {
+    const v = +$("reverb").value;
+    wet.gain.value = v;
+    dry.gain.value = 1 - v * 0.5;
+  }
+}
+
+function draw() {
+  const c = $("spectrum");
+  const g = c.getContext("2d");
+
+  function frame() {
+    requestAnimationFrame(frame);
+    if (!analyser) return;
+
+    const w = c.clientWidth;
+    const h = c.clientHeight;
+    const dpr = window.devicePixelRatio || 1;
+
+    if (c.width !== w * dpr || c.height !== h * dpr) {
+      c.width = w * dpr;
+      c.height = h * dpr;
+    }
+
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+    const data = new Uint8Array(analyser.frequencyBinCount);
+    analyser.getByteFrequencyData(data);
+    g.clearRect(0, 0, w, h);
+
+    const minHz = 20;
+    const maxHz = Math.min(20000, ctx.sampleRate / 2);
+    const hzPerBin = ctx.sampleRate / analyser.fftSize;
+    const logRange = Math.log(maxHz / minHz);
+
+    const xForHz = hz =>
+      w * Math.log(Math.max(minHz, hz) / minHz) / logRange;
+
+    g.fillStyle = "#b8ef43";
+
+    for (let i = 1; i < data.length; i++) {
+      const hz = i * hzPerBin;
+      if (hz < minHz || hz > maxHz) continue;
+
+      const nextHz = Math.min(maxHz, (i + 1) * hzPerBin);
+      const x = xForHz(hz);
+      const barW = Math.max(1, xForHz(nextHz) - x);
+      const barH = data[i] / 255 * h;
+
+      g.fillRect(x, h - barH, barW, barH);
+    }
+  }
+
+  frame();
+}
+</script>
+</body>
+</html>
